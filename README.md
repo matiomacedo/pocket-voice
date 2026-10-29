@@ -3,9 +3,11 @@
 Claude Code reads its responses aloud using [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts). The model runs locally on the CPU.
 
 - When Claude finishes a turn, the response is spoken. Code blocks, URLs, tables markup and `file:line` refs are skipped.
-- With several sessions open, responses are spoken one after another in the order they finish.
+- With several sessions open, responses are spoken one after another in the order they finish. Each session gets its own voice, and the project folder name is said when the speaker changes to another session.
 - Sending a new prompt stops that session's speech; other sessions keep their turn.
+- `/pocket-voice:voice-skip` skips the response being spoken; the next one in line starts.
 - `/pocket-voice:voice-stop` stops all speech, including responses waiting their turn.
+- `/pocket-voice:voice-set <voice>` changes the current session's voice.
 - `/pocket-voice:voice-toggle` turns voice off or on.
 
 ## How it works
@@ -30,6 +32,7 @@ Add to `~/.claude/keybindings.json`:
   "bindings": [
     { "context": "Chat", "bindings": {
       "ctrl+x s": "command:pocket-voice:voice-stop",
+      "ctrl+x n": "command:pocket-voice:voice-skip",
       "ctrl+x v": "command:pocket-voice:voice-toggle"
     } }
   ]
@@ -38,7 +41,12 @@ Add to `~/.claude/keybindings.json`:
 
 ## Options
 
-- `CLAUDE_VOICE`: voice name, read when the daemon starts. The default is `alba`. Others include `marius`, `jean`, `eve`, `george`, `jane`, `michael` and `vera`.
+These are read when the daemon starts. To apply a change, run `pkill -f voiced.py`; the next response starts it again.
+
+- `CLAUDE_VOICE`: the first session's voice. The default is `alba`. Others include `marius`, `jean`, `charles`, `eve`, `george`, `jane`, `michael` and `vera`.
+- `CLAUDE_VOICES`: comma-separated voices that new sessions are given, least used first. The default is `CLAUDE_VOICE` followed by `alba`, `george`, `eve` and `michael`. Set it to one voice to use the same voice everywhere.
+- `CLAUDE_VOICE_RATE`: playback speed, for example `1.2`. The default is `1`.
+- `CLAUDE_VOICE_MAX_SENTENCES`: speak at most this many sentences of each response. The default is no limit.
 - Debug log: `~/.cache/claude-voice/daemon.log`.
 
 ## License and credits

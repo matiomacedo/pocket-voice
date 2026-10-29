@@ -4,6 +4,8 @@
   speak.py               Stop hook: read hook JSON from stdin and speak last_assistant_message
   speak.py --prompt      UserPromptSubmit hook: stop this session's speech
   speak.py --stop        /voice-stop: stop all speech, including other sessions' queued responses
+  speak.py --skip        /voice-skip: stop the response playing now; the next one starts
+  speak.py --voice NAME  /voice-set: change this session's voice
   speak.py --toggle      mute / unmute
   speak.py --dry-run     print the cleaned text from stdin instead of speaking
 """
@@ -57,8 +59,10 @@ def send(msg):
         s.connect(SOCK_PATH)
         s.sendall(json.dumps(msg).encode())
         s.shutdown(socket.SHUT_WR)
-        if s.recv(16) != b"ok":
+        reply = s.recv(64)
+        if not reply:
             raise ConnectionError("no answer from daemon")
+        return reply.decode()
 
 
 def daemon_running():
@@ -75,6 +79,11 @@ def spawn_daemon():
     with open(LOG_PATH, "a") as f:
         return subprocess.Popen([uv, "run", "--script", DAEMON], stdout=f, stderr=f,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def notify(text):
+    subprocess.Popen(["osascript", "-e", f'display notification "{text}" with title "pocket-voice"'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def send_starting_daemon(msg, started):
@@ -99,6 +108,7 @@ def send_starting_daemon(msg, started):
             except OSError as e:
                 log(f"cannot start daemon (is uv installed?): {e}")
                 return
+            notify("Loading voice…")
         if time.monotonic() > deadline:
             log(f"daemon did not answer within {DAEMON_STARTUP_SECONDS}s")
             return
@@ -140,6 +150,24 @@ def main():
     elif arg == "--stop":
         open(PROMPTED_FLAG, "w").close()
         stop()
+    elif arg == "--skip":
+        try:
+            send({"cmd": "skip"})
+        except OSError:
+            pass  # daemon not running, nothing to skip
+    elif arg == "--voice":
+        name = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+        if not name:
+            print("Usage: /voice-set <voice>, for example /voice-set eve.")
+            return
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        reply = send_starting_daemon({"cmd": "voice", "session": session, "name": name}, time.time())
+        if reply == "ok":
+            print(f"Voice set to {name}.")
+        elif reply:
+            print(f"Unknown voice: {name}.")
+        else:
+            print("The voice daemon is not available, see ~/.cache/claude-voice/daemon.log.")
     elif arg == "--toggle":
         if os.path.exists(MUTED_FLAG):
             os.unlink(MUTED_FLAG)
@@ -158,8 +186,9 @@ def main():
             return
         text = clean(message)
         if text and not os.path.exists(MUTED_FLAG):
-            send_starting_daemon({"cmd": "speak", "session": hook.get("session_id", ""), "text": text},
-                                 started)
+            name = re.sub(r"[-_.]+", " ", os.path.basename(hook.get("cwd", "").rstrip("/"))).strip()
+            send_starting_daemon({"cmd": "speak", "session": hook.get("session_id", ""), "name": name,
+                                  "text": text}, started)
 
 
 if __name__ == "__main__":

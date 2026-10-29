@@ -4,8 +4,11 @@
 # ///
 """Pocket TTS daemon: keeps the model in memory and speaks text sent over a Unix socket.
 
-Protocol: one JSON object per connection, {"cmd": "speak", "session": "...", "text": "..."}
-or {"cmd": "stop", "session": "..."}. A stop without "session" stops all sessions.
+Protocol: one JSON object per connection, answered with "ok" or an error:
+  {"cmd": "speak", "session": "...", "name": "...", "text": "..."}  name: announced when sessions change
+  {"cmd": "stop", "session": "..."}  without "session", stops all sessions
+  {"cmd": "skip"}                    stop the response playing now; the next one starts
+  {"cmd": "voice", "session": "...", "name": "..."}
 """
 import fcntl
 import json
@@ -24,8 +27,16 @@ from pocket_tts import TTSModel
 STATE_DIR = os.path.expanduser("~/.cache/claude-voice")
 SOCK_PATH = os.path.join(STATE_DIR, "voice.sock")
 LOCK_PATH = os.path.join(STATE_DIR, "daemon.lock")
+SESSIONS_PATH = os.path.join(STATE_DIR, "sessions.json")  # session -> voice, written by the daemon only
 VOICE = os.environ.get("CLAUDE_VOICE", "alba")
+# New sessions take the least used of these voices, so sessions sound different.
+VOICES = ([v.strip() for v in os.environ.get("CLAUDE_VOICES", "").split(",") if v.strip()]
+          or [VOICE] + [v for v in ("alba", "george", "eve", "michael") if v != VOICE])
+RATE = os.environ.get("CLAUDE_VOICE_RATE")  # afplay playback rate, e.g. 1.2
+MAX_SENTENCES = int(os.environ.get("CLAUDE_VOICE_MAX_SENTENCES") or 0)  # 0: no limit
 IDLE_EXIT_SECONDS = 30 * 60
+RECENT_SESSION_SECONDS = 60 * 60
+OLD_STATE_SECONDS = 7 * 24 * 60 * 60
 
 
 def split_sentences(text):
@@ -33,10 +44,36 @@ def split_sentences(text):
     return [p.strip() for p in parts if re.search(r"\w", p)]
 
 
+def load_sessions():
+    try:
+        with open(SESSIONS_PATH) as f:
+            sessions = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in sessions.items() if time.time() - v["seen"] < OLD_STATE_SECONDS}
+
+
+def save_sessions(sessions):
+    with open(SESSIONS_PATH + ".tmp", "w") as f:
+        json.dump(sessions, f)
+    os.replace(SESSIONS_PATH + ".tmp", SESSIONS_PATH)
+
+
+def remove_old_prompted_flags():
+    # speak.py only needs these while it waits for the daemon to start.
+    for name in os.listdir(STATE_DIR):
+        path = os.path.join(STATE_DIR, name)
+        if name.startswith("prompted-") and time.time() - os.path.getmtime(path) > OLD_STATE_SECONDS:
+            os.unlink(path)
+
+
 class Speaker:
-    def __init__(self, model, voice_state):
+    def __init__(self, model):
         self.model = model
-        self.voice_state = voice_state
+        self.model_lock = threading.Lock()  # voice loading and generation share the model
+        self.voice_states = {}
+        self.sessions = load_sessions()
+        self.last_session = None  # session of the last queued response, for announcements
         # Each session's current response has a token. Both loops discard queued sentences
         # whose token is no longer current, so responses from other sessions keep their turn.
         self.tokens = {}
@@ -48,12 +85,40 @@ class Speaker:
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
 
-    def speak(self, session, text):
+    def voice_state(self, voice):
+        with self.model_lock:
+            if voice not in self.voice_states:
+                self.voice_states[voice] = self.model.get_state_for_audio_prompt(voice)
+            return self.voice_states[voice]
+
+    def session_voice(self, session):
+        now = time.time()
+        entry = self.sessions.get(session)
+        if entry is None:
+            recent = [e["voice"] for e in self.sessions.values() if now - e["seen"] < RECENT_SESSION_SECONDS]
+            entry = self.sessions[session] = {"voice": min(VOICES, key=recent.count)}
+        entry["seen"] = now
+        save_sessions(self.sessions)
+        return entry["voice"]
+
+    def set_voice(self, session, voice):
+        self.voice_state(voice)  # raises for an unknown voice
+        self.sessions[session] = {"voice": voice, "seen": time.time()}
+        save_sessions(self.sessions)
+
+    def speak(self, session, text, name=""):
+        voice = self.session_voice(session)
+        sentences = split_sentences(text)
+        if MAX_SENTENCES:
+            sentences = sentences[:MAX_SENTENCES]
+        if name and self.last_session not in (None, session):
+            sentences.insert(0, name + ".")
+        self.last_session = session
         with self.lock:
             self._interrupt(session)
             token = self.tokens[session] = object()
-            for sentence in split_sentences(text):
-                self.text_q.put((session, token, sentence))
+            for sentence in sentences:
+                self.text_q.put((session, token, voice, sentence))
 
     def stop(self, session=None):
         # No session: stop everything, including responses queued by other sessions.
@@ -63,6 +128,11 @@ class Speaker:
                 self._kill_player()
             else:
                 self._interrupt(session)
+
+    def skip(self):
+        with self.lock:
+            if self.player and self.player.poll() is None:
+                self._interrupt(self.player_session)
 
     def _interrupt(self, session):
         self.tokens.pop(session, None)
@@ -78,11 +148,13 @@ class Speaker:
 
     def _synth_loop(self):
         while True:
-            session, token, sentence = self.text_q.get()
+            session, token, voice, sentence = self.text_q.get()
             if not self._current(session, token):
                 continue
             try:
-                audio = self.model.generate_audio(self.voice_state, sentence)
+                state = self.voice_state(voice)
+                with self.model_lock:
+                    audio = self.model.generate_audio(state, sentence)
                 if not self._current(session, token):
                     continue
                 fd, path = tempfile.mkstemp(suffix=".wav", dir=STATE_DIR)
@@ -99,7 +171,8 @@ class Speaker:
             with self.lock:
                 player = None
                 if self._current(session, token):
-                    player = self.player = subprocess.Popen(["afplay", path])
+                    rate = ["-r", RATE] if RATE else []
+                    player = self.player = subprocess.Popen(["afplay", *rate, path])
                     self.player_session = session
             if player:
                 player.wait()
@@ -116,8 +189,9 @@ def main():
         print("another daemon is running, exiting", flush=True)
         return
 
-    model = TTSModel.load_model()
-    speaker = Speaker(model, model.get_state_for_audio_prompt(VOICE))
+    remove_old_prompted_flags()
+    speaker = Speaker(TTSModel.load_model())
+    speaker.voice_state(VOICES[0])
 
     if os.path.exists(SOCK_PATH):
         os.unlink(SOCK_PATH)
@@ -125,7 +199,7 @@ def main():
     server.bind(SOCK_PATH)
     server.listen()
     server.settimeout(60)
-    print(f"ready, voice={VOICE}", flush=True)
+    print(f"ready, voices={','.join(VOICES)}", flush=True)
 
     last_activity = time.monotonic()
     while time.monotonic() - last_activity < IDLE_EXIT_SECONDS:
@@ -141,13 +215,22 @@ def main():
                 continue
             if not isinstance(msg, dict):
                 continue
+            reply = b"ok"
             if msg.get("cmd") == "speak":
-                speaker.speak(str(msg.get("session", "")), str(msg.get("text", "")))
+                speaker.speak(str(msg.get("session", "")), str(msg.get("text", "")), str(msg.get("name", "")))
             elif msg.get("cmd") == "stop":
                 session = msg.get("session")
                 speaker.stop(None if session is None else str(session))
+            elif msg.get("cmd") == "skip":
+                speaker.skip()
+            elif msg.get("cmd") == "voice":
+                try:
+                    speaker.set_voice(str(msg.get("session", "")), str(msg.get("name", "")))
+                except Exception as e:
+                    print(f"cannot load voice: {e!r}", flush=True)
+                    reply = b"unknown voice"
             try:
-                conn.sendall(b"ok")
+                conn.sendall(reply)
             except OSError:
                 pass
 

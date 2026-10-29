@@ -1,5 +1,5 @@
 ---
-description: Stop speaking the current response
+description: Stop all speech, including responses waiting their turn
 disable-model-invocation: true
 allowed-tools: Bash(python3:*)
 ---
