@@ -4,7 +4,8 @@
 # ///
 """Pocket TTS daemon: keeps the model in memory and speaks text sent over a Unix socket.
 
-Protocol: one JSON object per connection, {"cmd": "speak", "text": "..."} or {"cmd": "stop"}.
+Protocol: one JSON object per connection, {"cmd": "speak", "session": "...", "text": "..."}
+or {"cmd": "stop", "session": "..."}. A stop without "session" stops all sessions.
 """
 import fcntl
 import json
@@ -36,38 +37,53 @@ class Speaker:
     def __init__(self, model, voice_state):
         self.model = model
         self.voice_state = voice_state
-        self.generation = 0
+        # Each session's current response has a token. Both loops discard queued sentences
+        # whose token is no longer current, so responses from other sessions keep their turn.
+        self.tokens = {}
         self.lock = threading.Lock()
         self.player = None
+        self.player_session = None
         self.text_q = queue.Queue()
         self.audio_q = queue.Queue()
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
 
-    def speak(self, text):
+    def speak(self, session, text):
         with self.lock:
-            self._interrupt()
+            self._interrupt(session)
+            token = self.tokens[session] = object()
             for sentence in split_sentences(text):
-                self.text_q.put((self.generation, sentence))
+                self.text_q.put((session, token, sentence))
 
-    def stop(self):
+    def stop(self, session=None):
+        # No session: stop everything, including responses queued by other sessions.
         with self.lock:
-            self._interrupt()
+            if session is None:
+                self.tokens.clear()
+                self._kill_player()
+            else:
+                self._interrupt(session)
 
-    def _interrupt(self):
-        # Bumping the generation makes both loops discard anything queued earlier.
-        self.generation += 1
+    def _interrupt(self, session):
+        self.tokens.pop(session, None)
+        if self.player_session == session:
+            self._kill_player()
+
+    def _kill_player(self):
         if self.player and self.player.poll() is None:
             self.player.kill()
 
+    def _current(self, session, token):
+        return self.tokens.get(session) is token
+
     def _synth_loop(self):
         while True:
-            gen, sentence = self.text_q.get()
-            if gen != self.generation:
+            session, token, sentence = self.text_q.get()
+            if not self._current(session, token):
                 continue
             try:
                 audio = self.model.generate_audio(self.voice_state, sentence)
-                if gen != self.generation:
+                if not self._current(session, token):
                     continue
                 fd, path = tempfile.mkstemp(suffix=".wav", dir=STATE_DIR)
                 os.close(fd)
@@ -75,15 +91,16 @@ class Speaker:
             except Exception as e:
                 print(f"generation failed: {e!r}", flush=True)
                 continue
-            self.audio_q.put((gen, path))
+            self.audio_q.put((session, token, path))
 
     def _play_loop(self):
         while True:
-            gen, path = self.audio_q.get()
+            session, token, path = self.audio_q.get()
             with self.lock:
                 player = None
-                if gen == self.generation:
+                if self._current(session, token):
                     player = self.player = subprocess.Popen(["afplay", path])
+                    self.player_session = session
             if player:
                 player.wait()
             os.unlink(path)
@@ -125,9 +142,10 @@ def main():
             if not isinstance(msg, dict):
                 continue
             if msg.get("cmd") == "speak":
-                speaker.speak(str(msg.get("text", "")))
+                speaker.speak(str(msg.get("session", "")), str(msg.get("text", "")))
             elif msg.get("cmd") == "stop":
-                speaker.stop()
+                session = msg.get("session")
+                speaker.stop(None if session is None else str(session))
             try:
                 conn.sendall(b"ok")
             except OSError:

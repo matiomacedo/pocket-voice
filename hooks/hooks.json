@@ -1,11 +1,11 @@
 {
-  "description": "Speak responses with Pocket TTS; stop speaking when a new prompt is sent",
+  "description": "Speak responses with Pocket TTS; stop a session's speech when a new prompt is sent there",
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\"", "async": true } ] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --stop" } ] }
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" --prompt" } ] }
     ]
   }
 }
