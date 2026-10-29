@@ -1,0 +1,8 @@
+{
+  "name": "pocket-voice",
+  "description": "Local voice output for Claude Code.",
+  "owner": { "name": "matiomacedo" },
+  "plugins": [
+    { "name": "pocket-voice", "source": "./", "description": "Speaks Claude's responses aloud with Kyutai Pocket TTS." }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "pocket-voice",
+  "version": "0.1.0",
+  "description": "Speaks Claude's responses aloud with Kyutai Pocket TTS (local, CPU).",
+  "author": {
+    "name": "matiomacedo"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/matiomacedo/pocket-voice",
+  "repository": "https://github.com/matiomacedo/pocket-voice"
+}
